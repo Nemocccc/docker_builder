@@ -88,7 +88,8 @@ RUN set -ex \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip \
     && pip3 install --upgrade pip \
-    && apt-get clean \
+	&& pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+	&& apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 EOF
 	                echo "" >> Dockerfile
@@ -98,8 +99,7 @@ EOF
 					then
 	                    cat <<'EOF' >> Dockerfile
 COPY requirements.txt .
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
-    && pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 EOF
 	                    echo "" >> Dockerfile
 	                fi
@@ -126,6 +126,23 @@ RUN set -ex \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
     && . $HOME/.cargo/env \
     && rustup update
+
+RUN mkdir -p ~/.cargo \
+	&& echo '[source.crates-io]' > ~/.cargo/config \
+    && echo 'replace-with = "rsproxy"' >> ~/.cargo/config \
+    && echo '' >> ~/.cargo/config \
+    && echo '[source.rsproxy]' >> ~/.cargo/config \
+    && echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config \
+    && echo '' >> ~/.cargo/config \
+    && echo '[registries.rsproxy]' >> ~/.cargo/config \
+    && echo 'index = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config \
+    && echo '' >> ~/.cargo/config \
+    && echo '[net]' >> ~/.cargo/config \
+    && echo 'git-fetch-with-cli = true' >> ~/.cargo/config \
+	&& echo "" >> ~/.bashrc \
+	&& echo "export RUSTUP_DIST_SERVER="https://rsproxy.cn" >> ~/.bashrc \
+	&& echo "export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup" >> ~/.bashrc
+
 
 ENV PATH="$PATH:/root/.cargo/bin"
 EOF
