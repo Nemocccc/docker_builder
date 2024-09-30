@@ -118,7 +118,11 @@ EOF
 	                cat <<'EOF' >> Dockerfile
 RUN set -ex \
     && apt-get update \
-    && curl -sSf https://sh.rustup.rs | sh -s -- -y \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
+    # 更新 PATH 环境变量以包含 rustup
+    && echo 'source $HOME/.cargo/env' >> $HOME/.bashrc \
+    # 使用新的环境变量运行 rustup update
+    && . $HOME/.cargo/env \
     && rustup update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -147,7 +151,6 @@ docker_compose_maker() {
 	#if [[ if_default == 'y' ]];
 	#then
 	cat <<EOF > docker-compose.yml
-version: '3'
 services:
   ${image_name}:
     build:
