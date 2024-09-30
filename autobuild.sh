@@ -1,6 +1,6 @@
 #!/bin/bash
 #author: nemo
-#version: 0.4
+#version: 0.6
 #date: 2024/09/28
 
 
@@ -118,14 +118,16 @@ EOF
 	                cat <<'EOF' >> Dockerfile
 RUN set -ex \
     && apt-get update \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
-    # 更新 PATH 环境变量以包含 rustup
-    && echo 'source $HOME/.cargo/env' >> $HOME/.bashrc \
-    # 使用新的环境变量运行 rustup update
-    && . $HOME/.cargo/env \
-    && rustup update \
+    && apt-get install -y git curl build-essential cmake \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+RUN set -ex \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
+    && . $HOME/.cargo/env \
+    && rustup update
+
+ENV PATH="$PATH:/root/.cargo/bin"
 EOF
 	                echo "" >> Dockerfile
 	                ;;
