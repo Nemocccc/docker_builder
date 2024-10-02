@@ -86,7 +86,7 @@ EOF
 	                cat <<'EOF' >> Dockerfile
 RUN set -ex \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip \
+    && apt-get install -y python3 python3-pip \
     && pip3 install --upgrade pip \
 	&& pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple \
 	&& apt-get clean \
@@ -108,7 +108,7 @@ EOF
 	                cat <<'EOF' >> Dockerfile
 RUN set -ex \
     && apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake \
+    && apt-get install -y build-essential cmake \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 EOF
@@ -118,17 +118,13 @@ EOF
 	                cat <<'EOF' >> Dockerfile
 RUN set -ex \
     && apt-get update \
-    && apt-get install -y git curl build-essential cmake \
+    && apt-get install -y curl build-essential cmake \	
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -ex \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
-    && . $HOME/.cargo/env \
-    && rustup update
-
-RUN mkdir -p ~/.cargo \
-	&& echo '[source.crates-io]' > ~/.cargo/config \
+	&& mkdir -p ~/.cargo \
+    && echo '[source.crates-io]' > ~/.cargo/config \
     && echo 'replace-with = "rsproxy"' >> ~/.cargo/config \
     && echo '' >> ~/.cargo/config \
     && echo '[source.rsproxy]' >> ~/.cargo/config \
@@ -139,10 +135,15 @@ RUN mkdir -p ~/.cargo \
     && echo '' >> ~/.cargo/config \
     && echo '[net]' >> ~/.cargo/config \
     && echo 'git-fetch-with-cli = true' >> ~/.cargo/config \
-	&& echo "" >> ~/.bashrc \
-	&& echo "export RUSTUP_DIST_SERVER="https://rsproxy.cn" >> ~/.bashrc \
-	&& echo "export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup" >> ~/.bashrc
-
+    && echo "" >> ~/.bashrc \
+    && echo "export RUSTUP_DIST_SERVER="https://rsproxy.cn"" >> ~/.bashrc \
+    && echo "export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"" >> ~/.bashrc \
+	&& curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y  \
+    && . $HOME/.cargo/env \
+    && rustup update \
+	&& apt-get clean \
+	&& rm -rf /var/lib/apt/lists/* \
+	
 
 ENV PATH="$PATH:/root/.cargo/bin"
 EOF
