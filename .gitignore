@@ -1,8 +1,14 @@
+# 本地设计文档（不进 git，自己改着玩）
+SPEC.md
+
 # 旧版手搓实现（保留以备参考，不参与新代码逻辑）
 .old/
 
 # dev container CLI 自动生成的 lockfile（运行时产物）
 .devcontainer-lock.json
+
+# 本机测试残留的 dev container（v0.1 时代可能用 init 在根目录生成过）
+/.devcontainer/
 
 # python 编译缓存
 __pycache__/

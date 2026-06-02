@@ -1,4 +1,5 @@
-FROM python:3.14-slim-trixie
+ARG BASE_IMAGE=python:3.14-slim-trixie
+FROM ${BASE_IMAGE}
 
 <EMBED _common.dockerfile>
 

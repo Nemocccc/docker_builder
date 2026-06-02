@@ -1,4 +1,5 @@
-FROM node:24-trixie-slim
+ARG BASE_IMAGE=node:24-trixie-slim
+FROM ${BASE_IMAGE}
 
 <EMBED _common.dockerfile>
 

@@ -1,4 +1,5 @@
-FROM rust:1-trixie
+ARG BASE_IMAGE=rust:1-trixie
+FROM ${BASE_IMAGE}
 
 <EMBED _common.dockerfile>
 

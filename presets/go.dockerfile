@@ -1,4 +1,5 @@
-FROM golang:1.26-trixie
+ARG BASE_IMAGE=golang:1.26-trixie
+FROM ${BASE_IMAGE}
 
 <EMBED _common.dockerfile>
 

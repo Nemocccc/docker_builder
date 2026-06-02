@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-docker-builder — scaffold devcontainer.json + Dockerfile from a recipe preset.
+docker-builder — scaffold devcontainer.json + Dockerfile from recipe presets.
 
-Usage:
-  docker-builder list
-  docker-builder new <name> --preset <id> [--output <dir>] [--force]
-  docker-builder up    [path]
-  docker-builder down  [path]
-  docker-builder init  --preset <id>
+Multiple presets stack: --preset python cpp rust means
+"from python:3.14-slim-trixie, also install cpp toolchain, also install rust toolchain".
+The first preset determines the FROM; subsequent presets add RUN blocks + json fields
+to the same base image. No multi-stage in v0.2 — just stacked layers (matches the
+old hand-rolled bash prototype's "Input image layers you want" model).
 
 Stdlib only. No pip, no brew.
 """
@@ -16,9 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -37,27 +38,19 @@ def warn(msg: str) -> None:  print(f"{C.Y}!{C.OFF} {msg}", file=sys.stderr)
 def err(msg: str) -> None:   print(f"{C.R}✗{C.OFF} {msg}", file=sys.stderr)
 def dim(msg: str) -> None:   print(f"{C.DIM}  {msg}{C.OFF}", file=sys.stderr)
 
-# -------- 路径常量 --------
+# -------- 路径 --------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PRESETS_DIR = SCRIPT_DIR / "presets"
 COMMON_DOCKERFILE = PRESETS_DIR / "_common.dockerfile"
 COMMON_JSON = PRESETS_DIR / "_common.json"
+COMMON_PRESET_ID = "_common"
 
-# -------- 预设发现 --------
-def discover_presets() -> list[str]:
-    """返回所有 preset id（<id>.json 文件中包含 name 字段的）。跳过 _ 开头的内部片段。"""
-    if not PRESETS_DIR.is_dir():
-        err(f"presets dir not found: {PRESETS_DIR}")
-        sys.exit(1)
-    ids = []
-    for p in sorted(PRESETS_DIR.glob("*.json")):
-        if p.stem.startswith("_"):
-            continue
-        ids.append(p.stem)
-    return ids
+DEVCONTAINER_INSTALL_URL = (
+    "https://raw.githubusercontent.com/devcontainers/cli/main/scripts/install.sh"
+)
 
+# -------- 预设加载 --------
 def load_preset(preset_id: str) -> tuple[dict[str, Any], str]:
-    """加载 preset 的 JSON 和 dockerfile 片段。"""
     json_path = PRESETS_DIR / f"{preset_id}.json"
     df_path = PRESETS_DIR / f"{preset_id}.dockerfile"
     if not json_path.is_file():
@@ -67,53 +60,109 @@ def load_preset(preset_id: str) -> tuple[dict[str, Any], str]:
         err(f"preset '{preset_id}' missing .dockerfile fragment at {df_path}")
         sys.exit(1)
     with json_path.open() as f:
-        data = json.load(f)
-    return data, df_path.read_text()
+        return json.load(f), df_path.read_text()
 
-def load_common() -> tuple[dict[str, Any], str]:
-    with COMMON_JSON.open() as f:
-        common_json = json.load(f)
-    common_df = COMMON_DOCKERFILE.read_text()
-    return common_json, common_df
-
-# -------- 渲染（拼接片段）--------
-def render_dockerfile(preset_df: str, common_df: str) -> str:
-    """把 <EMBED _common.dockerfile> 占位符替换为通用片段内容。
-
-    通用片段的注释行（仅供 preset 维护者参考）会被剥离，避免污染生成产物。
-    """
-    marker = "<EMBED _common.dockerfile>"
-    if marker not in preset_df:
-        err(f"preset .dockerfile missing '{marker}' marker")
+def discover_presets() -> list[str]:
+    if not PRESETS_DIR.is_dir():
+        err(f"presets dir not found: {PRESETS_DIR}")
         sys.exit(1)
-    cleaned = "\n".join(
+    return sorted(p.stem for p in PRESETS_DIR.glob("*.json") if not p.stem.startswith("_"))
+
+# -------- 渲染 --------
+def strip_common_comments(common_df: str) -> str:
+    """通用片段的注释行（仅供 preset 维护者参考）会被剥离，避免污染生成产物。"""
+    return "\n".join(
         line for line in common_df.splitlines() if not line.lstrip().startswith("#")
     ).strip("\n")
-    return preset_df.replace(marker, cleaned)
 
-def merge_json(preset_json: dict[str, Any], common_json: dict[str, Any]) -> dict[str, Any]:
-    """合并 preset 和 common。preset 优先；vscode extensions 是列表合并。"""
-    merged = dict(common_json)
-    for k, v in preset_json.items():
-        if k == "customizations" and "customizations" in merged:
-            # 合并 vscode extensions
-            merged_cust = dict(merged["customizations"])
-            for tool, tool_cfg in v.items():
-                if tool in merged_cust and "extensions" in tool_cfg and "extensions" in merged_cust[tool]:
-                    seen = set(merged_cust[tool]["extensions"])
-                    seen.update(tool_cfg["extensions"])
-                    merged_cust.setdefault(tool, {}).setdefault("extensions", [])
-                    merged_cust[tool]["extensions"] = list(seen)
-                    # 其他字段 preset 覆盖
-                    for kk, vv in tool_cfg.items():
-                        if kk != "extensions":
-                            merged_cust[tool][kk] = vv
-                else:
-                    merged_cust[tool] = tool_cfg
-            merged["customizations"] = merged_cust
-        else:
-            merged[k] = v
-    return merged
+def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[str]) -> str:
+    """多 preset 拼接：
+    - 第一个 preset 保留 ARG BASE_IMAGE / FROM ${BASE_IMAGE}，其 <EMBED> 标记移除
+    - 后续 preset 去掉 EMBED、ARG BASE_IMAGE、FROM 行（共用第一个的 base）
+    - 通用片段去注释后插入第一个 preset 之后、其余 preset 之前
+    - 特殊：第一个 preset 是 _common 时，直接返回 cleaned_common（不加 FROM）
+    """
+    cleaned_common = strip_common_comments(common_df)
+    if not preset_dfs:
+        return cleaned_common + "\n"
+    if preset_ids and preset_ids[0] == COMMON_PRESET_ID:
+        return cleaned_common + "\n"
+    processed: list[str] = []
+    for i, pdf in enumerate(preset_dfs):
+        text = pdf
+        text = re.sub(r"<EMBED _common\.dockerfile>\n?", "", text)
+        if i > 0:
+            text = re.sub(r"^ARG BASE_IMAGE=.*\n", "", text, flags=re.MULTILINE)
+            text = re.sub(r"^FROM \$\{BASE_IMAGE\}\n", "", text, flags=re.MULTILINE)
+        processed.append(text.rstrip())
+    head = processed[0]
+    rest = "\n\n".join(processed[1:]).lstrip("\n")
+    parts = [head, cleaned_common]
+    if rest:
+        parts.append(rest)
+    return "\n\n".join(parts).rstrip() + "\n"
+
+def merge_json(common_json: dict[str, Any], preset_jsons: list[dict[str, Any]]) -> dict[str, Any]:
+    """合并规则：
+    - common + 第 1 个 preset 作基础（preset 覆盖 common）
+    - 后续 preset 只追加列表型字段（vscode extensions、forwardPorts），不覆盖其他字段
+    """
+    if not preset_jsons:
+        return dict(common_json)
+    # 1. base = common | first_preset
+    base = dict(common_json)
+    for k, v in preset_jsons[0].items():
+        base[k] = v
+    # 2. 后续 preset 累加列表
+    for pj in preset_jsons[1:]:
+        for k, v in pj.items():
+            if k == "customizations" and "customizations" in base:
+                merged_cust = dict(base["customizations"])
+                for tool, tool_cfg in v.items():
+                    if tool in merged_cust and isinstance(tool_cfg, dict) and "extensions" in tool_cfg and isinstance(merged_cust[tool], dict) and "extensions" in merged_cust[tool]:
+                        seen = list(merged_cust[tool]["extensions"])
+                        for ext in tool_cfg["extensions"]:
+                            if ext not in seen:
+                                seen.append(ext)
+                        new_tool = dict(merged_cust[tool])
+                        new_tool["extensions"] = seen
+                        for kk, vv in tool_cfg.items():
+                            if kk != "extensions":
+                                new_tool[kk] = vv
+                        merged_cust[tool] = new_tool
+                    else:
+                        merged_cust[tool] = tool_cfg
+                base["customizations"] = merged_cust
+            elif k == "forwardPorts" and "forwardPorts" in base:
+                # 累加端口去重
+                seen_ports = list(base["forwardPorts"])
+                for p in v:
+                    if p not in seen_ports:
+                        seen_ports.append(p)
+                base["forwardPorts"] = seen_ports
+            # 其他字段（name / image / postCreateCommand / build / 等）忽略，保持第一个 preset 的值
+    return base
+
+# -------- doctor --------
+def check_docker_cli() -> bool:
+    return shutil.which("docker") is not None
+
+def check_docker_daemon() -> bool:
+    if not check_docker_cli():
+        return False
+    r = subprocess.run(["docker", "info"], capture_output=True, text=True)
+    return r.returncode == 0
+
+def check_devcontainer_cli() -> bool:
+    return shutil.which("devcontainer") is not None
+
+def check_network() -> bool:
+    try:
+        req = urllib.request.Request("https://github.com", method="HEAD")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
 
 # -------- 命令：list --------
 def cmd_list(_: argparse.Namespace) -> None:
@@ -131,24 +180,30 @@ def cmd_list(_: argparse.Namespace) -> None:
 
 # -------- 命令：new --------
 def cmd_new(args: argparse.Namespace) -> None:
-    preset_id = args.preset
-    preset_json, preset_df = load_preset(preset_id)
-    common_json, common_df = load_common()
-
+    # 1. 解析 preset 列表（无 --preset = _common）
+    presets: list[str] = list(args.preset) if args.preset else [COMMON_PRESET_ID]
+    # 2. 检查重复
+    seen = set()
+    for p in presets:
+        if p in seen:
+            err(f"duplicate preset '{p}' in --preset. list: {presets}")
+            sys.exit(1)
+        seen.add(p)
+    # 3. 先验证所有 preset 都存在（避免创建空目录）
+    for p in presets:
+        if not (PRESETS_DIR / f"{p}.json").is_file() or not (PRESETS_DIR / f"{p}.dockerfile").is_file():
+            err(f"preset '{p}' not found. Available: {', '.join(discover_presets())}")
+            sys.exit(1)
+    # 4. 解析 target 路径
     if getattr(args, "here", False):
-        # --here: 在 --output 指定的目录就地生成（不创建子目录）
         target = Path(args.output).resolve()
     else:
-        # 否则: target = <output>/<name>
         if not args.name:
-            err("'name' is required (or pass --here to generate in --output directly)")
+            err("'name' is required (or pass --here)")
             sys.exit(1)
-        output_root = Path(args.output).resolve()
-        target = (output_root / args.name).resolve()
+        target = (Path(args.output).resolve() / args.name).resolve()
     devc_dir = target / ".devcontainer"
 
-    # 已存在检查：仅在 .devcontainer 已存在时拒绝
-    # （--here 模式下 target 本身可以已存在，里面没 .devcontainer 就 OK）
     if devc_dir.is_dir():
         if not args.force:
             err(f"'{devc_dir}' already exists. use --force to overwrite.")
@@ -159,26 +214,42 @@ def cmd_new(args: argparse.Namespace) -> None:
     devc_dir.mkdir()
     info(f"created {target}/")
 
-    # 渲染并写 Dockerfile
-    dockerfile_content = render_dockerfile(preset_df, common_df)
+    # 5. 加载片段
+    common_json, common_df = load_common_safe()
+    preset_jsons: list[dict[str, Any]] = []
+    preset_dfs: list[str] = []
+    for pid in presets:
+        pj, pdf = load_preset(pid)
+        preset_jsons.append(pj)
+        preset_dfs.append(pdf)
+
+    # 6. 渲染
+    dockerfile_content = render_dockerfile(preset_dfs, common_df, presets)
     (devc_dir / "Dockerfile").write_text(dockerfile_content)
     info("created .devcontainer/Dockerfile")
 
-    # 合并并写 devcontainer.json
-    merged = merge_json(preset_json, common_json)
-    merged.setdefault("name", preset_id)
-    (devc_dir / "devcontainer.json").write_text(
-        json.dumps(merged, indent=2) + "\n"
-    )
+    if common_json is None:
+        common_json = {}
+    merged = merge_json(common_json, preset_jsons)
+    merged.setdefault("name", presets[0])
+    (devc_dir / "devcontainer.json").write_text(json.dumps(merged, indent=2) + "\n")
     info("created .devcontainer/devcontainer.json")
 
     dim(f"next: cd {target} && docker-builder up")
 
-# -------- 命令：up --------
-DEVCONTAINER_INSTALL_URL = "https://raw.githubusercontent.com/devcontainers/cli/main/scripts/install.sh"
+def load_common_safe() -> tuple[dict[str, Any] | None, str]:
+    """加载 _common；_common.json 缺失时容错（v0.1 可能还没建）。"""
+    common_json = None
+    common_df = ""
+    if COMMON_JSON.is_file():
+        with COMMON_JSON.open() as f:
+            common_json = json.load(f)
+    if COMMON_DOCKERFILE.is_file():
+        common_df = COMMON_DOCKERFILE.read_text()
+    return common_json, common_df
 
+# -------- devcontainer CLI 自动装 --------
 def ensure_devcontainer_cli() -> str:
-    """如果 devcontainer CLI 不可用，询问用户是否安装。返回可执行路径。"""
     found = shutil.which("devcontainer")
     if found:
         return found
@@ -200,7 +271,6 @@ def ensure_devcontainer_cli() -> str:
     if rc != 0:
         err(f"install script exited {rc}")
         sys.exit(1)
-    # 写到 ~/.zshrc / ~/.bashrc（仅当 PATH 行不存在时）
     bin_dir = Path.home() / ".devcontainers" / "bin"
     export_line = f'export PATH="{bin_dir}:$PATH"'
     for rcfile in (Path.home() / ".zshrc", Path.home() / ".bashrc"):
@@ -210,8 +280,7 @@ def ensure_devcontainer_cli() -> str:
                 with rcfile.open("a") as f:
                     f.write(f"\n# devcontainer CLI\n{export_line}\n")
     info(f"installed to {bin_dir}; PATH export added to ~/.zshrc and ~/.bashrc")
-    info("(open a new shell, or run `export PATH={bin_dir}:$PATH` in this one)")
-    # 当前进程 PATH 也加上
+    info(f"(open a new shell, or run `export PATH={bin_dir}:$PATH` in this one)")
     os.environ["PATH"] = f"{bin_dir}:" + os.environ.get("PATH", "")
     found2 = shutil.which("devcontainer")
     if not found2:
@@ -220,7 +289,6 @@ def ensure_devcontainer_cli() -> str:
     return found2
 
 def find_workspace(path: str | None) -> Path:
-    """找到包含 .devcontainer/devcontainer.json 的目录。"""
     if path:
         p = Path(path).resolve()
         if not (p / ".devcontainer" / "devcontainer.json").is_file():
@@ -233,40 +301,116 @@ def find_workspace(path: str | None) -> Path:
     err("no .devcontainer/devcontainer.json in current dir. pass a path or run from project root.")
     sys.exit(1)
 
+# -------- up: doctor 快速检查 --------
+def quick_doctor() -> None:
+    if not check_docker_cli():
+        err("docker CLI not found. install Docker Desktop or docker-ce.")
+        sys.exit(1)
+    if not check_docker_daemon():
+        err("docker CLI found but daemon not responding. is Docker Desktop running?")
+        sys.exit(1)
+    dim("docker OK")
+
+# -------- 命令：up --------
 def cmd_up(args: argparse.Namespace) -> None:
+    quick_doctor()
     ensure_devcontainer_cli()
     ws = find_workspace(args.path)
-    info(f"devcontainer up --workspace-folder {ws}")
-    rc = subprocess.run(["devcontainer", "up", "--workspace-folder", str(ws)]).returncode
-    sys.exit(rc)
-
-def cmd_down(args: argparse.Namespace) -> None:
-    ws = find_workspace(args.path)
-    info(f"devcontainer down --workspace-folder {ws}  (falls back to docker stop+rm)")
-    # devcontainer CLI 没有 down 子命令（README 里写 [ ] 未实现）
-    # 用 docker stop / docker rm 兜底
-    # 先尝试按 label 找容器
-    rc = subprocess.run(
-        ["docker", "ps", "-a", "--filter", f"label=devcontainer.local_folder={ws}",
-         "--format", "{{.ID}} {{.Names}}"],
+    # 容器名：--name 优先，否则用 workspace basename + -dev
+    if args.name:
+        container_name = args.name
+    else:
+        container_name = ws.name + "-dev"
+    info(f"devcontainer up --workspace-folder {ws} --name {container_name}")
+    rc = subprocess.run([
+        "devcontainer", "up",
+        "--workspace-folder", str(ws),
+        "--name", container_name,
+    ]).returncode
+    if rc != 0:
+        sys.exit(rc)
+    if args.no_exec:
+        info(f"container '{container_name}' is up. attach with: docker exec -it {container_name} bash")
+        return
+    # 找容器 ID（按 label 过滤）
+    r = subprocess.run(
+        ["docker", "ps", "-a", "--filter", f"name=^{container_name}$",
+         "--format", "{{.ID}}\t{{.Names}}\t{{.State}}"],
         capture_output=True, text=True,
     )
-    if rc.returncode != 0:
-        err(f"docker ps failed: {rc.stderr}")
-        sys.exit(1)
-    containers = [line.split() for line in rc.stdout.splitlines() if line.strip()]
-    if not containers:
-        warn(f"no running devcontainer found for {ws}")
+    if r.returncode != 0 or not r.stdout.strip():
+        warn(f"container '{container_name}' not found in docker ps. manual attach may be needed.")
         return
-    for cid, cname in containers:
+    info(f"attaching to {container_name} (Ctrl+D to detach)")
+    # 用 os.execvp 替换当前进程，让 exec -it 接管 tty
+    first = r.stdout.splitlines()[0].split("\t")
+    cid = first[0]
+    try:
+        os.execvp("docker", ["docker", "exec", "-it", cid, "bash"])
+    except OSError as e:
+        err(f"failed to exec: {e}")
+        sys.exit(1)
+
+# -------- 命令：down --------
+def cmd_down(args: argparse.Namespace) -> None:
+    ws = find_workspace(args.path)
+    info(f"stopping dev container for {ws}")
+    container_name = ws.name + "-dev"
+    r = subprocess.run(
+        ["docker", "ps", "-a", "--filter", f"name=^{container_name}$",
+         "--format", "{{.ID}}\t{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        err(f"docker ps failed: {r.stderr}")
+        sys.exit(1)
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    if not lines:
+        # 兜底：按 label 找
+        r2 = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"label=devcontainer.local_folder={ws}",
+             "--format", "{{.ID}}\t{{.Names}}"],
+            capture_output=True, text=True,
+        )
+        lines = [l for l in r2.stdout.splitlines() if l.strip()]
+    if not lines:
+        warn(f"no running dev container found for {ws}")
+        return
+    for line in lines:
+        cid, cname = line.split("\t", 1)
         info(f"stopping {cname}")
         subprocess.run(["docker", "stop", cid], check=False)
         info(f"removing {cname}")
         subprocess.run(["docker", "rm", cid], check=False)
 
+# -------- 命令：doctor --------
+def cmd_doctor(_: argparse.Namespace) -> None:
+    print(f"{C.B}docker-builder doctor{C.OFF}", file=sys.stderr)
+    print(f"{C.DIM}{'-'*40}{C.OFF}", file=sys.stderr)
+    rows = [
+        ("docker CLI installed", check_docker_cli(), "install Docker Desktop / docker-ce"),
+        ("docker daemon reachable", check_docker_daemon(), "start Docker Desktop / dockerd"),
+        ("devcontainer CLI installed", check_devcontainer_cli(),
+         "`up` will offer to install it via official script"),
+        ("network reachable (github.com)", check_network(),
+         "check your proxy / firewall settings"),
+    ]
+    all_ok = True
+    for label, ok, hint in rows:
+        if ok:
+            print(f"  {C.G}✓{C.OFF} {label}", file=sys.stderr)
+        else:
+            all_ok = False
+            print(f"  {C.R}✗{C.OFF} {label}  {C.DIM}({hint}){C.OFF}", file=sys.stderr)
+    print(file=sys.stderr)
+    if all_ok:
+        info("all checks passed. ready to `docker-builder up`.")
+    else:
+        warn("some checks failed. fix above before running `up`.")
+        sys.exit(1)
+
 # -------- 命令：init --------
 def cmd_init(args: argparse.Namespace) -> None:
-    """在当前目录生成 .devcontainer（要求当前目录无 devcontainer.json）。"""
     cur = Path.cwd()
     if (cur / ".devcontainer" / "devcontainer.json").is_file():
         err(".devcontainer/devcontainer.json already exists. abort.")
@@ -278,19 +422,16 @@ def cmd_init(args: argparse.Namespace) -> None:
     cmd_new(args)
 
 # -------- 参数解析 --------
-PRESETS_HELP = (
-    "available presets: " + ", ".join("<built-in>") + "\n"
-    "  run `docker-builder list` to see all presets with their images"
-)
-
 EPILOG = """\
 examples:
   docker-builder list
+  docker-builder doctor
   docker-builder new myapp --preset python
-  docker-builder new myapp --preset python --output ~/work
-  docker-builder new --here --preset rust           # generate in cwd
-  docker-builder new --here --preset python ~/work  # generate in ~/work
-  docker-builder up [path]
+  docker-builder new myapp --preset python cpp          # python base + cpp toolchain
+  docker-builder new myapp --preset python cpp rust     # 3-language stack
+  docker-builder new                                     # uses _common only (minimal base)
+  docker-builder new --here --preset rust
+  docker-builder up [path] [--name NAME] [--no-exec]
   docker-builder down [path]
 
 first-time setup:
@@ -300,7 +441,7 @@ first-time setup:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="docker-builder",
-        description="scaffold .devcontainer/{Dockerfile,devcontainer.json} from a recipe preset",
+        description="scaffold .devcontainer/{Dockerfile,devcontainer.json} by stacking recipe presets",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -315,12 +456,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_new = sub.add_parser(
         "new",
-        help="create a new project directory with .devcontainer/",
+        help="create a new project directory with .devcontainer/ (stacks multiple presets)",
         description=(
             "Create a new project directory and populate it with .devcontainer/\n"
-            "(Dockerfile + devcontainer.json) from the chosen preset.\n\n"
-            "By default creates <output>/<name>/. Use --here to skip the <name>\n"
-            "subdirectory and generate directly in --output (or cwd if omitted)."
+            "(Dockerfile + devcontainer.json) from one or more stacked presets.\n\n"
+            "The first preset determines the FROM line (base image). Subsequent\n"
+            "presets add their toolchain RUN blocks to the same base image —\n"
+            "no multi-stage, just stacked layers (matches the legacy\n"
+            "hand-rolled prototype's model).\n\n"
+            "If --preset is omitted, the _common fragment is used alone (minimal\n"
+            "debian base with git, sudo, and a non-root vscode user)."
         ),
     )
     p_new.add_argument(
@@ -328,8 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="project directory name. omit when using --here.",
     )
     p_new.add_argument(
-        "--preset", required=True,
-        help="preset id, e.g. base / python / node-vite / rust / go / cpp",
+        "--preset", nargs="+", default=None,
+        help="one or more preset ids to stack (e.g. python cpp). omit for _common only.",
     )
     p_new.add_argument(
         "--output", default=".",
@@ -337,47 +482,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_new.add_argument(
         "--here", action="store_true",
-        help="generate in --output directly (no <name> subdirectory). equivalent to old `init`.",
+        help="generate in --output directly (no <name> subdirectory).",
     )
     p_new.add_argument(
         "--force", action="store_true",
-        help="overwrite target directory if it already exists",
+        help="overwrite target .devcontainer/ if it already exists",
     )
     p_new.set_defaults(func=cmd_new)
 
     p_up = sub.add_parser(
         "up",
-        help="build and start the devcontainer (attaches shell)",
-        description="Run `devcontainer up` against the project's .devcontainer/devcontainer.json. Attaches a shell into the running container on success.",
+        help="build and start the devcontainer (attaches shell by default)",
+        description=(
+            "Run `devcontainer up` against the project's .devcontainer/devcontainer.json.\n"
+            "On success, automatically `docker exec -it <name> bash` to attach a shell.\n"
+            "Pass --no-exec to skip the auto-attach (start the container in the background)."
+        ),
     )
-    p_up.add_argument(
-        "path", nargs="?",
-        help="project dir containing .devcontainer/ (default: cwd)",
-    )
+    p_up.add_argument("path", nargs="?", help="project dir containing .devcontainer/ (default: cwd)")
+    p_up.add_argument("--name", help="container name (default: <workspace>-dev)")
+    p_up.add_argument("--no-exec", action="store_true", help="start container in background, do not attach")
     p_up.set_defaults(func=cmd_up)
 
     p_down = sub.add_parser(
         "down",
-        help="stop and remove the devcontainer (docker stop+rm fallback)",
-        description=(
-            "Stop and remove the dev container. devcontainer CLI does not yet ship\n"
-            "a `down` subcommand, so this falls back to `docker stop` + `docker rm`\n"
-            "filtered by the devcontainer.local_folder label."
-        ),
+        help="stop and remove the dev container (docker stop+rm fallback)",
+        description="Stop and remove the dev container. Falls back to docker stop+rm by name (or by devcontainer.local_folder label if name doesn't match).",
     )
-    p_down.add_argument(
-        "path", nargs="?",
-        help="project dir containing .devcontainer/ (default: cwd)",
-    )
+    p_down.add_argument("path", nargs="?", help="project dir containing .devcontainer/ (default: cwd)")
     p_down.set_defaults(func=cmd_down)
 
     p_init = sub.add_parser(
         "init",
         help="[alias] generate .devcontainer/ in current dir using --preset",
-        description="Shortcut for `new --here --preset <id>` from the current directory. Kept for backward compatibility; prefer `new --here` in new scripts.",
+        description="Shortcut for `new --here --preset <id>` from the current directory.",
     )
-    p_init.add_argument("--preset", required=True, help="preset id")
+    p_init.add_argument("--preset", nargs="+", default=None, help="one or more preset ids to stack")
     p_init.set_defaults(func=cmd_init)
+
+    p_doc = sub.add_parser(
+        "doctor",
+        help="check docker / devcontainer CLI / network availability",
+        description="Verify that docker, devcontainer CLI, and outbound network are all working. `up` runs a subset of these checks automatically.",
+    )
+    p_doc.set_defaults(func=cmd_doctor)
 
     return p
 
