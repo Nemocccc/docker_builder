@@ -135,18 +135,27 @@ def cmd_new(args: argparse.Namespace) -> None:
     preset_json, preset_df = load_preset(preset_id)
     common_json, common_df = load_common()
 
-    output_root = Path(args.output).resolve()
-    target = (output_root / args.name).resolve() if args.name else output_root
+    if getattr(args, "here", False):
+        # --here: 在 --output 指定的目录就地生成（不创建子目录）
+        target = Path(args.output).resolve()
+    else:
+        # 否则: target = <output>/<name>
+        if not args.name:
+            err("'name' is required (or pass --here to generate in --output directly)")
+            sys.exit(1)
+        output_root = Path(args.output).resolve()
+        target = (output_root / args.name).resolve()
     devc_dir = target / ".devcontainer"
 
-    if target.exists():
+    # 已存在检查：仅在 .devcontainer 已存在时拒绝
+    # （--here 模式下 target 本身可以已存在，里面没 .devcontainer 就 OK）
+    if devc_dir.is_dir():
         if not args.force:
-            err(f"'{target}' already exists. use --force to overwrite.")
+            err(f"'{devc_dir}' already exists. use --force to overwrite.")
             sys.exit(1)
-        warn(f"overwriting '{target}'")
-        if target.is_dir():
-            shutil.rmtree(target)
-    target.mkdir(parents=True)
+        warn(f"overwriting '{devc_dir}'")
+        shutil.rmtree(devc_dir)
+    target.mkdir(parents=True, exist_ok=True)
     devc_dir.mkdir()
     info(f"created {target}/")
 
@@ -257,42 +266,116 @@ def cmd_down(args: argparse.Namespace) -> None:
 
 # -------- 命令：init --------
 def cmd_init(args: argparse.Namespace) -> None:
-    """在当前目录生成 .devcontainer（要求当前目录为空或仅含 dotfiles）。"""
+    """在当前目录生成 .devcontainer（要求当前目录无 devcontainer.json）。"""
     cur = Path.cwd()
     if (cur / ".devcontainer" / "devcontainer.json").is_file():
         err(".devcontainer/devcontainer.json already exists. abort.")
         sys.exit(1)
     args.output = str(cur)
     args.force = True
+    args.here = True
+    args.name = None
     cmd_new(args)
 
 # -------- 参数解析 --------
+PRESETS_HELP = (
+    "available presets: " + ", ".join("<built-in>") + "\n"
+    "  run `docker-builder list` to see all presets with their images"
+)
+
+EPILOG = """\
+examples:
+  docker-builder list
+  docker-builder new myapp --preset python
+  docker-builder new myapp --preset python --output ~/work
+  docker-builder new --here --preset rust           # generate in cwd
+  docker-builder new --here --preset python ~/work  # generate in ~/work
+  docker-builder up [path]
+  docker-builder down [path]
+
+first-time setup:
+  ./install.sh                # installs devcontainer CLI + symlinks docker-builder
+"""
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="docker-builder",
-        description="scaffold devcontainer.json + Dockerfile from a recipe preset",
+        description="scaffold .devcontainer/{Dockerfile,devcontainer.json} from a recipe preset",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_list = sub.add_parser("list", help="list available presets")
+    p_list = sub.add_parser(
+        "list",
+        help="list available presets (id, image, post-create command)",
+        description="print a table of all built-in presets with their base image and post-create command.",
+    )
     p_list.set_defaults(func=cmd_list)
 
-    p_new = sub.add_parser("new", help="create a new project directory with .devcontainer/")
-    p_new.add_argument("name", help="project directory name (relative to --output, default .)")
-    p_new.add_argument("--preset", required=True, help="preset id (e.g. python, rust)")
-    p_new.add_argument("--output", default=".", help="parent dir for the new project (default: cwd)")
-    p_new.add_argument("--force", action="store_true", help="overwrite if target dir exists")
+    p_new = sub.add_parser(
+        "new",
+        help="create a new project directory with .devcontainer/",
+        description=(
+            "Create a new project directory and populate it with .devcontainer/\n"
+            "(Dockerfile + devcontainer.json) from the chosen preset.\n\n"
+            "By default creates <output>/<name>/. Use --here to skip the <name>\n"
+            "subdirectory and generate directly in --output (or cwd if omitted)."
+        ),
+    )
+    p_new.add_argument(
+        "name", nargs="?", default=None,
+        help="project directory name. omit when using --here.",
+    )
+    p_new.add_argument(
+        "--preset", required=True,
+        help="preset id, e.g. base / python / node-vite / rust / go / cpp",
+    )
+    p_new.add_argument(
+        "--output", default=".",
+        help="parent directory (default: cwd). ignored when --here is set.",
+    )
+    p_new.add_argument(
+        "--here", action="store_true",
+        help="generate in --output directly (no <name> subdirectory). equivalent to old `init`.",
+    )
+    p_new.add_argument(
+        "--force", action="store_true",
+        help="overwrite target directory if it already exists",
+    )
     p_new.set_defaults(func=cmd_new)
 
-    p_up = sub.add_parser("up", help="build and start the devcontainer (attaches shell)")
-    p_up.add_argument("path", nargs="?", help="project dir (default: cwd)")
+    p_up = sub.add_parser(
+        "up",
+        help="build and start the devcontainer (attaches shell)",
+        description="Run `devcontainer up` against the project's .devcontainer/devcontainer.json. Attaches a shell into the running container on success.",
+    )
+    p_up.add_argument(
+        "path", nargs="?",
+        help="project dir containing .devcontainer/ (default: cwd)",
+    )
     p_up.set_defaults(func=cmd_up)
 
-    p_down = sub.add_parser("down", help="stop and remove the devcontainer")
-    p_down.add_argument("path", nargs="?", help="project dir (default: cwd)")
+    p_down = sub.add_parser(
+        "down",
+        help="stop and remove the devcontainer (docker stop+rm fallback)",
+        description=(
+            "Stop and remove the dev container. devcontainer CLI does not yet ship\n"
+            "a `down` subcommand, so this falls back to `docker stop` + `docker rm`\n"
+            "filtered by the devcontainer.local_folder label."
+        ),
+    )
+    p_down.add_argument(
+        "path", nargs="?",
+        help="project dir containing .devcontainer/ (default: cwd)",
+    )
     p_down.set_defaults(func=cmd_down)
 
-    p_init = sub.add_parser("init", help="generate .devcontainer/ in current dir using --preset")
+    p_init = sub.add_parser(
+        "init",
+        help="[alias] generate .devcontainer/ in current dir using --preset",
+        description="Shortcut for `new --here --preset <id>` from the current directory. Kept for backward compatibility; prefer `new --here` in new scripts.",
+    )
     p_init.add_argument("--preset", required=True, help="preset id")
     p_init.set_defaults(func=cmd_init)
 
