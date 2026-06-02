@@ -1,0 +1,8 @@
+{
+  "name": "base",
+  "image": "debian:13-slim",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "bash --version"
+}

@@ -1,0 +1,15 @@
+{
+  "name": "rust",
+  "image": "rust:1-trixie",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "rustc --version && cargo --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer"
+      ]
+    }
+  }
+}

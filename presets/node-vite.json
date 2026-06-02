@@ -1,0 +1,17 @@
+{
+  "name": "node-vite",
+  "image": "node:24-trixie-slim",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "pnpm --version",
+  "forwardPorts": [5173],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "vue.volar",
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  }
+}

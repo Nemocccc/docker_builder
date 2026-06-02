@@ -1,0 +1,16 @@
+{
+  "name": "cpp",
+  "image": "debian:13-slim",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "g++ --version && cmake --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  }
+}

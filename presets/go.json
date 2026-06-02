@@ -1,0 +1,16 @@
+{
+  "name": "go",
+  "image": "golang:1.26-trixie",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "postCreateCommand": "go version",
+  "forwardPorts": [8080],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ]
+    }
+  }
+}

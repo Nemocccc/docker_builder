@@ -1,0 +1,15 @@
+# 旧版手搓实现（保留以备参考，不参与新代码逻辑）
+.old/
+
+# dev container CLI 自动生成的 lockfile（运行时产物）
+.devcontainer-lock.json
+
+# python 编译缓存
+__pycache__/
+*.pyc
+
+# macOS 噪音
+.DS_Store
+
+# 测试临时目录
+/tmp-test-*/
