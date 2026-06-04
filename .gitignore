@@ -19,3 +19,6 @@ __pycache__/
 
 # 测试临时目录
 /tmp-test-*/
+
+# 子 agent 调研产物（curl/raw evidence, 不要进 repo）
+/.research/

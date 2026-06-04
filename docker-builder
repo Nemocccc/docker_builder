@@ -75,18 +75,24 @@ def strip_common_comments(common_df: str) -> str:
         line for line in common_df.splitlines() if not line.lstrip().startswith("#")
     ).strip("\n")
 
+COMMON_DEFAULT_BASE_IMAGE = "debian:13-slim"
+
 def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[str]) -> str:
     """多 preset 拼接：
     - 第一个 preset 保留 ARG BASE_IMAGE / FROM ${BASE_IMAGE}，其 <EMBED> 标记移除
     - 后续 preset 去掉 EMBED、ARG BASE_IMAGE、FROM 行（共用第一个的 base）
     - 通用片段去注释后插入第一个 preset 之后、其余 preset 之前
-    - 特殊：第一个 preset 是 _common 时，直接返回 cleaned_common（不加 FROM）
+    - 特殊：第一个 preset 是 _common 时，自动注入 ARG BASE_IMAGE=debian:13-slim + FROM，
+            使 `new` 不传 --preset 也能 `up` 跑起来（v0.2.1: 修 empty base image）
     """
     cleaned_common = strip_common_comments(common_df)
     if not preset_dfs:
         return cleaned_common + "\n"
     if preset_ids and preset_ids[0] == COMMON_PRESET_ID:
-        return cleaned_common + "\n"
+        # v0.2.1: 之前直接返回 cleaned_common 缺 FROM，devcontainer up 会报 empty base image。
+        # 自动注入最常用的 debian:13-slim，与 `base` preset 行为一致。
+        header = f"ARG BASE_IMAGE={COMMON_DEFAULT_BASE_IMAGE}\nFROM ${{BASE_IMAGE}}\n\n"
+        return header + cleaned_common + "\n"
     processed: list[str] = []
     for i, pdf in enumerate(preset_dfs):
         text = pdf
@@ -316,32 +322,35 @@ def cmd_up(args: argparse.Namespace) -> None:
     quick_doctor()
     ensure_devcontainer_cli()
     ws = find_workspace(args.path)
-    # 容器名：--name 优先，否则用 workspace basename + -dev
+    # 容器 handle：--name 优先，否则用 workspace basename + -dev
     if args.name:
-        container_name = args.name
+        handle = args.name
     else:
-        container_name = ws.name + "-dev"
-    info(f"devcontainer up --workspace-folder {ws} --name {container_name}")
+        handle = ws.name + "-dev"
+    # v0.2.1: devcontainer up 没有 --name 参数（会报 UNKNOWN argument: name）。
+    # 改用 --id-label name=<handle>，容器上会贴 label：name=<handle>，事后用
+    # `docker ps --filter label=name=<handle>` 找回来再 docker exec。
+    info(f"devcontainer up --workspace-folder {ws} --id-label name={handle}")
     rc = subprocess.run([
         "devcontainer", "up",
         "--workspace-folder", str(ws),
-        "--name", container_name,
+        "--id-label", f"name={handle}",
     ]).returncode
     if rc != 0:
         sys.exit(rc)
     if args.no_exec:
-        info(f"container '{container_name}' is up. attach with: docker exec -it {container_name} bash")
+        info(f"container '{handle}' is up. attach with: docker ps -a --filter label=name={handle} && docker exec -it <id> bash")
         return
-    # 找容器 ID（按 label 过滤）
+    # 找容器 ID（按 label=name=<handle> 过滤）
     r = subprocess.run(
-        ["docker", "ps", "-a", "--filter", f"name=^{container_name}$",
+        ["docker", "ps", "-a", "--filter", f"label=name={handle}",
          "--format", "{{.ID}}\t{{.Names}}\t{{.State}}"],
         capture_output=True, text=True,
     )
     if r.returncode != 0 or not r.stdout.strip():
-        warn(f"container '{container_name}' not found in docker ps. manual attach may be needed.")
+        warn(f"container with label=name={handle} not found in docker ps. manual attach may be needed.")
         return
-    info(f"attaching to {container_name} (Ctrl+D to detach)")
+    info(f"attaching to {handle} (Ctrl+D to detach)")
     # 用 os.execvp 替换当前进程，让 exec -it 接管 tty
     first = r.stdout.splitlines()[0].split("\t")
     cid = first[0]
@@ -355,9 +364,11 @@ def cmd_up(args: argparse.Namespace) -> None:
 def cmd_down(args: argparse.Namespace) -> None:
     ws = find_workspace(args.path)
     info(f"stopping dev container for {ws}")
-    container_name = ws.name + "-dev"
+    # v0.2.1: 容器名/handle 从 ws.basename + -dev 派生（与 cmd_up 默认 handle 一致），
+    # 但过滤改用 label=name=<handle>，匹配 cmd_up 通过 --id-label 贴的标签。
+    handle = ws.name + "-dev"
     r = subprocess.run(
-        ["docker", "ps", "-a", "--filter", f"name=^{container_name}$",
+        ["docker", "ps", "-a", "--filter", f"label=name={handle}",
          "--format", "{{.ID}}\t{{.Names}}"],
         capture_output=True, text=True,
     )
@@ -366,7 +377,7 @@ def cmd_down(args: argparse.Namespace) -> None:
         sys.exit(1)
     lines = [l for l in r.stdout.splitlines() if l.strip()]
     if not lines:
-        # 兜底：按 label 找
+        # 兜底：按 devcontainer CLI 自带的 local_folder label 找
         r2 = subprocess.run(
             ["docker", "ps", "-a", "--filter", f"label=devcontainer.local_folder={ws}",
              "--format", "{{.ID}}\t{{.Names}}"],

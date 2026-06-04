@@ -2,6 +2,11 @@
 
 A small CLI to scaffold a dev environment (`.devcontainer/devcontainer.json` + `Dockerfile`) from one or more stacked recipe presets. Stdlib only — no pip, no brew, no extra dependencies.
 
+## v0.2.1 patch
+
+- **Fix:** `up` no longer passes `--name` to `devcontainer up` (which rejected it as `UNKNOWN argument: name`). Container is now identified via `--id-label name=<handle>` and looked up by `docker ps --filter label=name=<handle>`. `down` uses the same label.
+- **Fix:** `new` without `--preset` (i.e. _common-only) now injects `ARG BASE_IMAGE=debian:13-slim` + `FROM ${BASE_IMAGE}` so `up` no longer fails with an empty base image.
+
 Backed by the [dev container spec](https://containers.dev/) and the [devcontainer CLI](https://github.com/devcontainers/cli).
 
 ## Quick start
