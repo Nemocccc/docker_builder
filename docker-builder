@@ -75,24 +75,20 @@ def strip_common_comments(common_df: str) -> str:
         line for line in common_df.splitlines() if not line.lstrip().startswith("#")
     ).strip("\n")
 
-COMMON_DEFAULT_BASE_IMAGE = "debian:13-slim"
-
 def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[str]) -> str:
     """多 preset 拼接：
     - 第一个 preset 保留 ARG BASE_IMAGE / FROM ${BASE_IMAGE}，其 <EMBED> 标记移除
     - 后续 preset 去掉 EMBED、ARG BASE_IMAGE、FROM 行（共用第一个的 base）
     - 通用片段去注释后插入第一个 preset 之后、其余 preset 之前
-    - 特殊：第一个 preset 是 _common 时，自动注入 ARG BASE_IMAGE=debian:13-slim + FROM，
-            使 `new` 不传 --preset 也能 `up` 跑起来（v0.2.1: 修 empty base image）
+    - 特殊：第一个 preset 是 _common 时，直接返回 cleaned_common（不加 FROM）。
+            devcontainer spec 规定 image / Dockerfile 二选一且只能一个，ARG BASE_IMAGE
+            不是 spec 概念；这里留给用户自己加 FROM。如果用户只跑 new 不跑 up 没事。
     """
     cleaned_common = strip_common_comments(common_df)
     if not preset_dfs:
         return cleaned_common + "\n"
     if preset_ids and preset_ids[0] == COMMON_PRESET_ID:
-        # v0.2.1: 之前直接返回 cleaned_common 缺 FROM，devcontainer up 会报 empty base image。
-        # 自动注入最常用的 debian:13-slim，与 `base` preset 行为一致。
-        header = f"ARG BASE_IMAGE={COMMON_DEFAULT_BASE_IMAGE}\nFROM ${{BASE_IMAGE}}\n\n"
-        return header + cleaned_common + "\n"
+        return cleaned_common + "\n"
     processed: list[str] = []
     for i, pdf in enumerate(preset_dfs):
         text = pdf

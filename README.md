@@ -2,10 +2,18 @@
 
 A small CLI to scaffold a dev environment (`.devcontainer/devcontainer.json` + `Dockerfile`) from one or more stacked recipe presets. Stdlib only — no pip, no brew, no extra dependencies.
 
-## v0.2.1 patch
+## v0.2.2 — supersedes v0.2.1
 
-- **Fix:** `up` no longer passes `--name` to `devcontainer up` (which rejected it as `UNKNOWN argument: name`). Container is now identified via `--id-label name=<handle>` and looked up by `docker ps --filter label=name=<handle>`. `down` uses the same label.
-- **Fix:** `new` without `--preset` (i.e. _common-only) now injects `ARG BASE_IMAGE=debian:13-slim` + `FROM ${BASE_IMAGE}` so `up` no longer fails with an empty base image.
+**v0.2.1 was withdrawn** because it auto-injected `ARG BASE_IMAGE=debian:13-slim` + `FROM ${BASE_IMAGE}` into the `_common`-only path. That "fix" was cargo-culted — the dev container spec only supports a single `image` / `build.dockerfile`, and `ARG BASE_IMAGE` is not a spec concept (it's a dockerfile-level convenience for build-time args, not a base-image selector). Stacking presets onto a different base is not something a single Dockerfile can express; that's a docker-compose job. Reverted.
+
+### v0.2.2 fix (the only real one)
+
+- **`up`**: stop passing `--name <container>` to `devcontainer up` (which rejects it as `UNKNOWN argument: name`). Use `--id-label name=<handle>` instead and look the container up with `docker ps -a --filter label=name=<handle>` before `docker exec`. `down` uses the same label filter.
+
+### Known limitations (not in v0.2.2 scope — see v0.3)
+
+- Stacking two presets that need *different* base images (e.g. `--preset cpp python`) yields a single image with the first preset's base plus the second preset's toolchain layers, **not** the second preset's base. The second preset's `FROM` / `ARG BASE_IMAGE` lines are intentionally stripped because devcontainer.json can't reference multiple images. Workarounds: pick the base that satisfies both, or switch to a docker-compose workflow (planned for v0.3).
+- `new` without `--preset` produces a Dockerfile with no `FROM` (intentional, see v0.3 plan). Edit it to add one before `docker-builder up`.
 
 Backed by the [dev container spec](https://containers.dev/) and the [devcontainer CLI](https://github.com/devcontainers/cli).
 
