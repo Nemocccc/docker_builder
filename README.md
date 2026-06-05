@@ -2,15 +2,18 @@
 
 A small CLI to scaffold a dev environment (`.devcontainer/devcontainer.json` + `Dockerfile`) from one or more stacked recipe presets. Stdlib only — no pip, no brew, no extra dependencies.
 
-## v0.2.2 — supersedes v0.2.1
+## v0.2.3 — supersedes v0.2.2
 
-**v0.2.1 was withdrawn** because it auto-injected `ARG BASE_IMAGE=debian:13-slim` + `FROM ${BASE_IMAGE}` into the `_common`-only path. That "fix" was cargo-culted — the dev container spec only supports a single `image` / `build.dockerfile`, and `ARG BASE_IMAGE` is not a spec concept (it's a dockerfile-level convenience for build-time args, not a base-image selector). Stacking presets onto a different base is not something a single Dockerfile can express; that's a docker-compose job. Reverted.
+This release fixes four bugs in the core preset rendering logic that made generated Dockerfiles fail at build time.
 
-### v0.2.2 fix (the only real one)
+### v0.2.3 fixes
 
-- **`up`**: stop passing `--name <container>` to `devcontainer up` (which rejects it as `UNKNOWN argument: name`). Use `--id-label name=<handle>` instead and look the container up with `docker ps -a --filter label=name=<handle>` before `docker exec`. `down` uses the same label filter.
+- **`<EMBED>` inline expansion** (fixes build failure): `_common.dockerfile` content is now expanded in-place at the `<EMBED>` marker location, not removed-and-appended to the end of the first preset. Previously `USER vscode` and subsequent `RUN` commands from the preset executed *before* the vscode user was created, causing `docker build` to fail for all toolchain presets.
+- **`node-vite` npm permissions**: switch to `USER root` before `npm install -g pnpm` — the `node:24-trixie-slim` image's npm global directory is owned by root, causing EACCES under the non-root `vscode` user.
+- **`_common` apt-get failure masking**: parenthesised `(useradd ... || true)` so that `|| true` only covers the `useradd` scenario (user already exists) rather than swallowing any apt-get failure.
+- **`_common` as first preset in stack**: early-exit with an error message instead of silently dropping all subsequent presets.
 
-### Known limitations (not in v0.2.2 scope — see v0.3)
+### Known limitations (not in v0.2.3 scope — see v0.3)
 
 - Stacking two presets that need *different* base images (e.g. `--preset cpp python`) yields a single image with the first preset's base plus the second preset's toolchain layers, **not** the second preset's base. The second preset's `FROM` / `ARG BASE_IMAGE` lines are intentionally stripped because devcontainer.json can't reference multiple images. Workarounds: pick the base that satisfies both, or switch to a docker-compose workflow (planned for v0.3).
 - `new` without `--preset` produces a Dockerfile with no `FROM` (intentional, see v0.3 plan). Edit it to add one before `docker-builder up`.
