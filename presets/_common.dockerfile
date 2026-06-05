@@ -12,7 +12,7 @@ RUN apt-get update \
         ca-certificates \
         gnupg \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -s /bin/bash vscode 2>/dev/null || true \
+    && (useradd -m -s /bin/bash vscode 2>/dev/null || true) \
     && echo "vscode ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/vscode \
     && chmod 0440 /etc/sudoers.d/vscode
 

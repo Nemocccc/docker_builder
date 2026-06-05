@@ -77,32 +77,24 @@ def strip_common_comments(common_df: str) -> str:
 
 def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[str]) -> str:
     """多 preset 拼接：
-    - 第一个 preset 保留 ARG BASE_IMAGE / FROM ${BASE_IMAGE}，其 <EMBED> 标记移除
-    - 后续 preset 去掉 EMBED、ARG BASE_IMAGE、FROM 行（共用第一个的 base）
-    - 通用片段去注释后插入第一个 preset 之后、其余 preset 之前
-    - 特殊：第一个 preset 是 _common 时，直接返回 cleaned_common（不加 FROM）。
-            devcontainer spec 规定 image / Dockerfile 二选一且只能一个，ARG BASE_IMAGE
-            不是 spec 概念；这里留给用户自己加 FROM。如果用户只跑 new 不跑 up 没事。
+    - 第一个 preset 的 <EMBED> 标记替换为 _common 内容（inline 展开）
+    - 后续 preset 去掉 <EMBED>、ARG BASE_IMAGE、FROM 行（共用第一个的 base）
+    - 特殊：无 preset 或首个 preset 是 _common 时，直接返回 cleaned_common。
     """
     cleaned_common = strip_common_comments(common_df)
-    if not preset_dfs:
-        return cleaned_common + "\n"
-    if preset_ids and preset_ids[0] == COMMON_PRESET_ID:
+    if not preset_dfs or (preset_ids and preset_ids[0] == COMMON_PRESET_ID):
         return cleaned_common + "\n"
     processed: list[str] = []
     for i, pdf in enumerate(preset_dfs):
         text = pdf
-        text = re.sub(r"<EMBED _common\.dockerfile>\n?", "", text)
-        if i > 0:
+        if i == 0:
+            text = text.replace("<EMBED _common.dockerfile>", cleaned_common)
+        else:
+            text = text.replace("<EMBED _common.dockerfile>", "")
             text = re.sub(r"^ARG BASE_IMAGE=.*\n", "", text, flags=re.MULTILINE)
             text = re.sub(r"^FROM \$\{BASE_IMAGE\}\n", "", text, flags=re.MULTILINE)
         processed.append(text.rstrip())
-    head = processed[0]
-    rest = "\n\n".join(processed[1:]).lstrip("\n")
-    parts = [head, cleaned_common]
-    if rest:
-        parts.append(rest)
-    return "\n\n".join(parts).rstrip() + "\n"
+    return "\n\n".join(processed).rstrip() + "\n"
 
 def merge_json(common_json: dict[str, Any], preset_jsons: list[dict[str, Any]]) -> dict[str, Any]:
     """合并规则：
@@ -184,14 +176,19 @@ def cmd_list(_: argparse.Namespace) -> None:
 def cmd_new(args: argparse.Namespace) -> None:
     # 1. 解析 preset 列表（无 --preset = _common）
     presets: list[str] = list(args.preset) if args.preset else [COMMON_PRESET_ID]
-    # 2. 检查重复
+    # 2. _common 不能作为多 preset 堆叠的首个
+    if len(presets) > 1 and presets[0] == COMMON_PRESET_ID:
+        err("'_common' cannot be the first preset in a multi-preset stack. "
+            "omit --preset to use _common alone.")
+        sys.exit(1)
+    # 3. 检查重复
     seen = set()
     for p in presets:
         if p in seen:
             err(f"duplicate preset '{p}' in --preset. list: {presets}")
             sys.exit(1)
         seen.add(p)
-    # 3. 先验证所有 preset 都存在（避免创建空目录）
+    # 4. 先验证所有 preset 都存在（避免创建空目录）
     for p in presets:
         if not (PRESETS_DIR / f"{p}.json").is_file() or not (PRESETS_DIR / f"{p}.dockerfile").is_file():
             err(f"preset '{p}' not found. Available: {', '.join(discover_presets())}")
