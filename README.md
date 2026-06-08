@@ -2,17 +2,6 @@
 
 A small CLI to scaffold a dev environment (`.devcontainer/devcontainer.json` + `Dockerfile`) from one or more stacked recipe presets. Stdlib only — no pip, no brew, no extra dependencies.
 
-## v0.2.4 — custom bind mounts
-
-`--mount` is now supported on `new` and `init`. Syntax mirrors Docker's `-v`:
-
-```bash
-docker-builder new myapp --preset python --mount ~/data:/workspace/data
-docker-builder new myapp --mount ./config:/etc/config:ro --mount ~/.ssh:/home/vscode/.ssh:ro
-```
-
-Only the simple Docker style (`/src:/dst` or `/src:/dst:ro`) is supported. Source `~` is expanded; relative paths are resolved to the project root. Target must be absolute and must not contain `~`. Multiple `--mount` flags are merged with preset-defined mounts (same target = last wins).
-
 ## v0.2.3 — supersedes v0.2.2
 
 This release fixes four bugs in the core preset rendering logic that made generated Dockerfiles fail at build time.
@@ -82,7 +71,7 @@ Each preset is two files under `presets/`:
 At `new` time, `docker-builder`:
 1. Embeds `_common.dockerfile` between the first preset and the rest.
 2. Drops the `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}` lines from the 2nd+ presets (they share the first preset's base).
-3. Merges `_common.json` with the first preset's JSON (preset wins), then appends list fields (`vscode.extensions`, `forwardPorts`, `mounts`) from the rest. CLI `--mount` flags are merged last (same target = override).
+3. Merges `_common.json` with the first preset's JSON (preset wins), then appends list fields (`vscode.extensions`, `forwardPorts`) from the rest.
 4. Writes both to `<name>/.devcontainer/`.
 
 The generated `ARG BASE_IMAGE` line at the top is intentional: devcontainer CLI injects `--image` into it, which suppresses the `InvalidDefaultArgInFrom` BuildKit warning.
@@ -94,8 +83,8 @@ Edit the generated `Dockerfile` and `devcontainer.json` freely — `docker-build
 ```
 docker-builder list                                    # show all presets
 docker-builder doctor                                  # check docker / devcontainer CLI / network
-docker-builder new <name> --preset A [B C...] [--output DIR] [--here] [--force] [--mount SRC:TARGET[:ro] ...]
-docker-builder init  --preset A [B C...] [--mount SRC:TARGET[:ro] ...]               # alias for `new --here` in cwd
+docker-builder new <name> --preset A [B C...] [--output DIR] [--here] [--force]
+docker-builder init  --preset A [B C...]               # alias for `new --here` in cwd
 docker-builder up    [path] [--name NAME] [--no-exec]  # build + start + attach (or detach with --no-exec)
 docker-builder down  [path]                            # stop + remove container
 ```
