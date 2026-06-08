@@ -70,7 +70,7 @@ def discover_presets() -> list[str]:
 
 
 # -------- Mount 解析（简洁 Docker 风格，只做 /src:/dst 和 /src:/dst:ro）--------
-def parse_mount(raw: str, project_root: str) -> dict[str, Any] | None:
+def parse_mount(raw: str, project_root: str) -> str | None:
     """解析 --mount 参数为 devcontainer.json mount 字符串。
 
     只支持:  /host/path:/container/path[:ro]
@@ -103,11 +103,10 @@ def parse_mount(raw: str, project_root: str) -> dict[str, Any] | None:
         err(f"invalid --mount target '{target}': must start with /")
         return None
 
-    # 返回对象（由调用方 serial 化），避免 CLI 解析逗号分隔字符串时的歧义
-    obj = {"source": src, "target": target, "type": "bind"}
+    mount = f"source={src},target={target},type=bind"
     if readonly:
-        obj["readonly"] = True
-    return obj
+        mount += ',readonly=true'
+    return mount
 
 
 # -------- 渲染 --------
@@ -138,17 +137,13 @@ def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[st
         processed.append(text.rstrip())
     return "\n\n".join(processed).rstrip() + "\n"
 
-def _extract_target(mount_entry: Any) -> str:
-    """从 mount 条目（string 或 dict）中提取 target 路径，用于去重。"""
-    if isinstance(mount_entry, dict):
-        return mount_entry.get("target", "")
-    if isinstance(mount_entry, str):
-        m = re.search(r'(?:^|,)target=([^,]+)', mount_entry)
-        return m.group(1) if m else mount_entry
-    return str(mount_entry)
+def _extract_target(mount_str: str) -> str:
+    """从 mount 字符串提取 target 路径，用于去重。"""
+    m = re.search(r'(?:^|,)target=([^,]+)', mount_str)
+    return m.group(1) if m else mount_str
 
 
-def _merge_mounts(base: dict, new_mounts: list[Any]) -> None:
+def _merge_mounts(base: dict, new_mounts: list[str]) -> None:
     """合并 mounts：相同 target 后者覆盖前者。"""
     existing = list(base.get("mounts", []))
     seen: dict[str, int] = {}
