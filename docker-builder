@@ -68,6 +68,47 @@ def discover_presets() -> list[str]:
         sys.exit(1)
     return sorted(p.stem for p in PRESETS_DIR.glob("*.json") if not p.stem.startswith("_"))
 
+
+# -------- Mount 解析（简洁 Docker 风格，只做 /src:/dst 和 /src:/dst:ro）--------
+def parse_mount(raw: str, project_root: str) -> str | None:
+    """解析 --mount 参数为 devcontainer.json mount 字符串。
+
+    只支持:  /host/path:/container/path[:ro]
+    source 的 ~ 展开为绝对路径, 相对路径以 project_root 为基准绝对化。
+    target 必须以 / 开头, 不接受 ~。
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    parts = raw.split(':')
+    if len(parts) not in (2, 3):
+        err(f"invalid --mount '{raw}': expected src:dst or src:dst:ro")
+        return None
+    src, target = parts[0], parts[1]
+    if len(parts) == 3 and parts[2].lower() not in ('ro', 'r'):
+        err(f"invalid --mount '{raw}': unknown flag '{parts[2]}' (expected 'ro')")
+        return None
+    readonly = len(parts) == 3
+
+    # source: 展开 ~, 相对路径以 project_root 为基准绝对化
+    src = str(Path(src).expanduser())
+    if not os.path.isabs(src):
+        src = str((Path(project_root) / src).resolve())
+
+    # target: 必须绝对路径, 不接受 ~
+    if '~' in target:
+        err(f"invalid --mount target '{target}': container path must not contain ~")
+        return None
+    if not target.startswith('/'):
+        err(f"invalid --mount target '{target}': must start with /")
+        return None
+
+    mount = f"source={src},target={target},type=bind"
+    if readonly:
+        mount += ',readonly=true'
+    return mount
+
+
 # -------- 渲染 --------
 def strip_common_comments(common_df: str) -> str:
     """通用片段的注释行（仅供 preset 维护者参考）会被剥离，避免污染生成产物。"""
@@ -96,18 +137,40 @@ def render_dockerfile(preset_dfs: list[str], common_df: str, preset_ids: list[st
         processed.append(text.rstrip())
     return "\n\n".join(processed).rstrip() + "\n"
 
-def merge_json(common_json: dict[str, Any], preset_jsons: list[dict[str, Any]]) -> dict[str, Any]:
+def _extract_target(mount_str: str) -> str:
+    """从 mount 字符串提取 target 路径，用于去重。"""
+    m = re.search(r'(?:^|,)target=([^,]+)', mount_str)
+    return m.group(1) if m else mount_str
+
+
+def _merge_mounts(base: dict, new_mounts: list[str]) -> None:
+    """合并 mounts：相同 target 后者覆盖前者。"""
+    existing = list(base.get("mounts", []))
+    seen: dict[str, int] = {}
+    for i, m in enumerate(existing):
+        seen[_extract_target(m)] = i
+    for m in new_mounts:
+        t = _extract_target(m)
+        if t in seen:
+            existing[seen[t]] = m
+        else:
+            seen[t] = len(existing)
+            existing.append(m)
+    base["mounts"] = existing
+
+
+def merge_json(common_json: dict[str, Any], preset_jsons: list[dict[str, Any]],
+               extra_mounts: list[str] | None = None) -> dict[str, Any]:
     """合并规则：
     - common + 第 1 个 preset 作基础（preset 覆盖 common）
-    - 后续 preset 只追加列表型字段（vscode extensions、forwardPorts），不覆盖其他字段
+    - 后续 preset 只追加列表型字段（vscode extensions、forwardPorts、mounts）
+    - extra_mounts（CLI --mount）追到最后，同 target 后者覆盖
     """
     if not preset_jsons:
         return dict(common_json)
-    # 1. base = common | first_preset
     base = dict(common_json)
     for k, v in preset_jsons[0].items():
         base[k] = v
-    # 2. 后续 preset 累加列表
     for pj in preset_jsons[1:]:
         for k, v in pj.items():
             if k == "customizations" and "customizations" in base:
@@ -128,13 +191,17 @@ def merge_json(common_json: dict[str, Any], preset_jsons: list[dict[str, Any]]) 
                         merged_cust[tool] = tool_cfg
                 base["customizations"] = merged_cust
             elif k == "forwardPorts" and "forwardPorts" in base:
-                # 累加端口去重
                 seen_ports = list(base["forwardPorts"])
                 for p in v:
                     if p not in seen_ports:
                         seen_ports.append(p)
                 base["forwardPorts"] = seen_ports
-            # 其他字段（name / image / postCreateCommand / build / 等）忽略，保持第一个 preset 的值
+            elif k == "mounts" and "mounts" in base:
+                _merge_mounts(base, v)
+    if extra_mounts:
+        if "mounts" not in base:
+            base["mounts"] = []
+        _merge_mounts(base, extra_mounts)
     return base
 
 # -------- doctor --------
@@ -142,8 +209,6 @@ def check_docker_cli() -> bool:
     return shutil.which("docker") is not None
 
 def check_docker_daemon() -> bool:
-    if not check_docker_cli():
-        return False
     r = subprocess.run(["docker", "info"], capture_output=True, text=True)
     return r.returncode == 0
 
@@ -193,7 +258,7 @@ def cmd_new(args: argparse.Namespace) -> None:
         if not (PRESETS_DIR / f"{p}.json").is_file() or not (PRESETS_DIR / f"{p}.dockerfile").is_file():
             err(f"preset '{p}' not found. Available: {', '.join(discover_presets())}")
             sys.exit(1)
-    # 4. 解析 target 路径
+    # 5. 解析 target 路径
     if getattr(args, "here", False):
         target = Path(args.output).resolve()
     else:
@@ -214,7 +279,7 @@ def cmd_new(args: argparse.Namespace) -> None:
     info(f"created {target}/")
 
     # 5. 加载片段
-    common_json, common_df = load_common_safe()
+    common_json, common_df = load_common()
     preset_jsons: list[dict[str, Any]] = []
     preset_dfs: list[str] = []
     for pid in presets:
@@ -229,14 +294,22 @@ def cmd_new(args: argparse.Namespace) -> None:
 
     if common_json is None:
         common_json = {}
-    merged = merge_json(common_json, preset_jsons)
+    # 解析 CLI --mount 参数
+    cli_mounts: list[str] = []
+    if args.mount:
+        for m in args.mount:
+            parsed = parse_mount(m, str(target))
+            if parsed is None:
+                sys.exit(1)
+            cli_mounts.append(parsed)
+    merged = merge_json(common_json, preset_jsons, extra_mounts=cli_mounts or None)
     merged.setdefault("name", presets[0])
     (devc_dir / "devcontainer.json").write_text(json.dumps(merged, indent=2) + "\n")
     info("created .devcontainer/devcontainer.json")
 
     dim(f"next: cd {target} && docker-builder up")
 
-def load_common_safe() -> tuple[dict[str, Any] | None, str]:
+def load_common() -> tuple[dict[str, Any] | None, str]:
     """加载 _common；_common.json 缺失时容错（v0.1 可能还没建）。"""
     common_json = None
     common_df = ""
@@ -435,6 +508,8 @@ examples:
   docker-builder new myapp --preset python cpp rust     # 3-language stack
   docker-builder new                                     # uses _common only (minimal base)
   docker-builder new --here --preset rust
+  docker-builder new myapp --preset python --mount ~/data:/workspace/data
+  docker-builder new myapp --mount ./config:/etc/config:ro --mount ~/.ssh:/home/vscode/.ssh:ro
   docker-builder up [path] [--name NAME] [--no-exec]
   docker-builder down [path]
 
@@ -492,6 +567,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true",
         help="overwrite target .devcontainer/ if it already exists",
     )
+    p_new.add_argument(
+        "--mount", action="append", default=None,
+        metavar="SRC:TARGET[:ro]",
+        help="bind mount host dir into container (e.g. --mount ~/data:/workspace/data). Repeatable.",
+    )
     p_new.set_defaults(func=cmd_new)
 
     p_up = sub.add_parser(
@@ -522,6 +602,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Shortcut for `new --here --preset <id>` from the current directory.",
     )
     p_init.add_argument("--preset", nargs="+", default=None, help="one or more preset ids to stack")
+    p_init.add_argument(
+        "--mount", action="append", default=None,
+        metavar="SRC:TARGET[:ro]",
+        help="bind mount host dir into container. Repeatable.",
+    )
     p_init.set_defaults(func=cmd_init)
 
     p_doc = sub.add_parser(
